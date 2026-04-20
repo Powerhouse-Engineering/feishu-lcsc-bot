@@ -13,6 +13,9 @@ User sends an LCSC link or ID (for example `C2040`), bot replies with a KiCad co
 - Generates KiCad symbol/footprint/3D model by invoking local `JLC2KiCad_lib-master`.
 - Packages generated files as a `.zip`.
 - Uploads the archive to Feishu IM and sends it back in chat.
+- Supports `/info` to return live part info (stock, pricing tiers, package, lifecycle).
+- Supports `/compare` to compare multiple parts side-by-side.
+- Supports `/bom` via pasted text and CSV/XLSX uploads.
 - Supports optional STEP-only mode with `/step Cxxxx`.
 - Rejects group chats (only `p2p`).
 
@@ -40,6 +43,7 @@ The bot uses these endpoints:
 - `/auth/v3/tenant_access_token/internal/`
 - `/im/v1/messages`
 - `/im/v1/files`
+- `/im/v1/messages/{message_id}/resources/{file_key}` (BOM file download)
 
 After changing permissions/events, publish a new app version.
 
@@ -59,6 +63,11 @@ Optional:
 - `DEDUP_CAPACITY` (default `3000`)
 - `KICAD_LIBRARY_MODELS` (default `STEP`, accepted values: `STEP`, `WRL`, or both like `STEP WRL`)
 - `STEP_BACKEND_ORDER` (default `easyeda2kicad,jlc2kicad`, only used for `/step` mode)
+- `NODE_BIN` (optional absolute path to Node.js, useful under systemd when Node is installed via `nvm`)
+- `COMPARE_MAX_PARTS` (default `5`)
+- `BOM_MAX_PARTS` (default `20`)
+- `BOM_GENERATE_LIBS` (default `0`)
+- `BOM_MAX_LIBS` (default `5`)
 
 ## Reusing Existing Credentials From `feishu-expense-bot`
 
@@ -108,4 +117,7 @@ tail -f "/home/santilopez10/Feishu Bot/Feishu LCSC bot/logs/bot.log"
 1. Open 1:1 chat with the bot in Feishu.
 2. Send `C2040` (or any valid LCSC component ID / product link).
 3. Confirm bot sends back a `.zip` with KiCad library files.
-4. Optional: send `/step C2040` to request STEP-only output.
+4. Send `/info C2040` and confirm part info (stock/price tiers).
+5. Send `/compare C2040 C8596` and confirm compare summary.
+6. Send `/bom C2040,10` or upload a BOM CSV/XLSX file in the chat and confirm report generation.
+7. Optional: send `/step C2040` to request STEP-only output.

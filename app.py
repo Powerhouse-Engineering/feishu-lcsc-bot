@@ -5,12 +5,24 @@ import re
 import sys
 import threading
 import time
+import io
+import zipfile
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import lark_oapi as lark
 import requests
 from lcsc_step_downloader.core import fetch_component_library_archive, fetch_step_file
+from lcsc_step_downloader.part_data import (
+    BomParseResult,
+    build_bom_report_csv,
+    choose_unit_price,
+    fetch_part_snapshot,
+    format_compare,
+    format_part_info,
+    parse_bom_bytes,
+    parse_bom_text,
+)
 
 try:
     from dotenv import load_dotenv
@@ -33,6 +45,9 @@ HELP_TEXT = (
     "LCSC/JLCPCB Bot capabilities:\n"
     "- Generate full KiCad library ZIP (symbol + footprint + 3D model)\n"
     "- Generate STEP-only file on request\n"
+    "- Show live part info (stock, price tiers, package, lifecycle)\n"
+    "- Compare multiple parts side-by-side\n"
+    "- Parse BOM from text, CSV, or XLSX file uploads\n"
     "- Accept LCSC/JLCPCB part IDs and LCSC/JLCPCB product links\n"
     "- Notify if no library/model is available for the requested part\n"
     "- KiCad output can be imported into Altium (direct Altium generation is not supported)\n"
@@ -41,17 +56,30 @@ HELP_TEXT = (
     "Commands:\n"
     "- /help : show this message\n"
     "- /ping : health check (returns pong)\n"
+    "- /info <PART_ID> : show part info\n"
+    "- /compare <PART_ID> <PART_ID> ... : compare parts\n"
+    "- /bom <rows> : parse pasted BOM rows (or upload CSV/XLSX file)\n"
     "- /step <PART_ID> : STEP-only output\n"
     "- /library <PART_ID> : force library ZIP output\n"
     "\n"
     "Examples:\n"
     "- C2040\n"
+    "- /info C2040\n"
+    "- /compare C2040 C2871814 C8596\n"
+    "- /bom C2040,10\\nC8596,5\n"
+    "- /bom C2040,10 C8596,5 C7423108 x2\n"
     "- https://www.lcsc.com/product-detail/..._C2040.html\n"
     "- jlcpcb part number 2040\n"
     "- https://jlcpcb.com/partdetail/.../C2040\n"
     "- /step C2040\n"
     "- /library C2040"
 )
+
+INFO_CMD_RE = re.compile(r"^/info(\s|$)", flags=re.IGNORECASE)
+COMPARE_CMD_RE = re.compile(r"^/compare(\s|$)", flags=re.IGNORECASE)
+BOM_CMD_RE = re.compile(r"^/bom(\s|$)", flags=re.IGNORECASE)
+STEP_CMD_RE = re.compile(r"^/step(\s|$)", flags=re.IGNORECASE)
+LIBRARY_CMD_RE = re.compile(r"^/library(\s|$)", flags=re.IGNORECASE)
 
 
 def _is_scope_denied_error(exc: Exception, scope_tokens: List[str]) -> bool:
@@ -179,6 +207,43 @@ class FeishuClient:
             raise RuntimeError(f"upload_to_im_file returned empty file_key: {resp}")
         return file_key
 
+    def download_message_resource(
+        self,
+        message_id: str,
+        file_key: str,
+        resource_type: str = "file",
+        timeout: int = 120,
+    ) -> bytes:
+        mid = str(message_id or "").strip()
+        fkey = str(file_key or "").strip()
+        if not mid or not fkey:
+            raise RuntimeError("download_message_resource requires message_id and file_key")
+
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{mid}/resources/{fkey}"
+        resp = requests.get(
+            url,
+            headers=self._headers(),
+            params={"type": resource_type},
+            timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Feishu resource download failed {resp.status_code} {url}: {resp.text[:800]}")
+
+        content_type = str(resp.headers.get("Content-Type") or "").lower()
+        if "application/json" in content_type:
+            payload = None
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+                raise RuntimeError(f"download_message_resource failed: {payload}")
+
+        data = resp.content or b""
+        if not data:
+            raise RuntimeError("download_message_resource returned empty content")
+        return data
+
 
 def _configure_logging() -> None:
     level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
@@ -260,6 +325,44 @@ def _extract_lcsc_id(text: str) -> Optional[str]:
     return None
 
 
+def _extract_lcsc_ids(text: str) -> List[str]:
+    msg = str(text or "")
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    for hit in LCSC_ID_RE.finditer(msg):
+        pid = hit.group(0).upper()
+        if pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+
+    for hit in PART_PREFIXED_SPACED_RE.finditer(msg):
+        pid = f"C{hit.group(1)}"
+        if pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+
+    for hit in PART_EXPLICIT_NUMERIC_RE.finditer(msg):
+        token = str(hit.group(1) or "").strip().upper()
+        pid = None
+        if token.startswith("C") and token[1:].isdigit():
+            pid = f"C{token[1:]}"
+        elif token.isdigit():
+            pid = f"C{token}"
+        if pid and pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+
+    if not out:
+        # Fallback for compact compare-style inputs: "/compare 2040 8596 123456"
+        for token in re.findall(r"\b\d{3,}\b", msg):
+            pid = f"C{token}"
+            if pid not in seen:
+                seen.add(pid)
+                out.append(pid)
+    return out
+
+
 def _fetch_step_file(lcsc_id: str) -> Tuple[str, bytes]:
     return fetch_step_file(lcsc_id)
 
@@ -270,30 +373,248 @@ def _fetch_component_library_archive(lcsc_id: str) -> Tuple[str, bytes]:
 
 def _parse_request_mode(text: str) -> Tuple[str, str]:
     normalized = str(text or "").strip()
-    low = normalized.lower()
-    if re.match(r"^/step(\s|$)", low):
+    if STEP_CMD_RE.match(normalized):
         return "step", normalized[len("/step") :].strip()
-    if re.match(r"^step(\s|$)", low):
+    if re.match(r"^step(\s|$)", normalized, flags=re.IGNORECASE):
         return "step", normalized[len("step") :].strip()
-    if re.match(r"^/library(\s|$)", low):
+    if LIBRARY_CMD_RE.match(normalized):
         return "library", normalized[len("/library") :].strip()
     return "library", normalized
 
 
-def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
-    normalized = str(text or "").strip()
-    if not normalized:
-        fc.send_text(chat_id, HELP_TEXT)
+def _command_payload(text: str, command: str) -> str:
+    pattern = rf"^/{re.escape(command)}(?:\s+(.+))?$"
+    m = re.match(pattern, str(text or "").strip(), flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    return str(m.group(1) or "").strip()
+
+
+def _send_file_upload_permission_hint(fc: FeishuClient, chat_id: str) -> None:
+    fc.send_text(
+        chat_id,
+        "Bot is missing Feishu permission to upload files (`im:resource:upload` or `im:resource`). "
+        "Please enable permission and publish app release, then try again.",
+    )
+
+
+def _process_info_command(fc: FeishuClient, chat_id: str, payload: str) -> None:
+    lcsc_id = _extract_lcsc_id(payload)
+    if not lcsc_id:
+        fc.send_text(chat_id, "Usage: /info <PART_ID>. Example: /info C2040")
+        return
+    fc.send_text(chat_id, f"Fetching part info for {lcsc_id}...")
+    try:
+        snapshot = fetch_part_snapshot(lcsc_id)
+        fc.send_text(chat_id, format_part_info(snapshot))
+    except Exception as exc:
+        log.exception("Failed fetching part info for %s", lcsc_id)
+        fc.send_text(chat_id, f"Failed to fetch part info for {lcsc_id}: {exc}")
+
+
+def _process_compare_command(fc: FeishuClient, chat_id: str, payload: str) -> None:
+    ids = _extract_lcsc_ids(payload)
+    if len(ids) < 2:
+        fc.send_text(chat_id, "Usage: /compare <PART_ID> <PART_ID> [...]. Example: /compare C2040 C8596")
+        return
+    max_parts = max(2, int(os.getenv("COMPARE_MAX_PARTS", "5")))
+    selected = ids[:max_parts]
+    fc.send_text(chat_id, f"Comparing {len(selected)} parts: {', '.join(selected)}")
+
+    snapshots = []
+    failures = []
+    for pid in selected:
+        try:
+            snapshots.append(fetch_part_snapshot(pid))
+        except Exception as exc:
+            failures.append((pid, str(exc)))
+            log.exception("Failed loading compare data for %s", pid)
+
+    if snapshots:
+        fc.send_text(chat_id, format_compare(snapshots))
+    if failures:
+        detail = "; ".join([f"{pid}: {err}" for pid, err in failures[:5]])
+        fc.send_text(chat_id, f"Some parts could not be compared: {detail}")
+
+
+def _bundle_library_archives(libraries: Dict[str, bytes]) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for part_id, payload in libraries.items():
+            zf.writestr(f"{part_id}.zip", payload)
+    return out.getvalue()
+
+
+def _process_bom_entries(fc: FeishuClient, chat_id: str, parsed: BomParseResult, source_label: str) -> None:
+    if not parsed.entries:
+        message = f"No valid part IDs found in {source_label}."
+        if parsed.notes:
+            message += f" {' '.join(parsed.notes)}"
+        fc.send_text(chat_id, message)
         return
 
-    if normalized.lower() in {"/help", "help", "/start"}:
-        fc.send_text(chat_id, HELP_TEXT)
+    max_parts = max(1, int(os.getenv("BOM_MAX_PARTS", "20")))
+    selected_ids = list(parsed.entries.keys())[:max_parts]
+    truncated = len(parsed.entries) - len(selected_ids)
+    fc.send_text(chat_id, f"Processing BOM: {len(selected_ids)} unique parts from {source_label}...")
+
+    report_rows: List[Dict[str, Any]] = []
+    total_cost = 0.0
+    cost_parts = 0
+    success_ids: List[str] = []
+    errors: List[str] = []
+
+    for part_id in selected_ids:
+        qty = int(parsed.entries.get(part_id) or 1)
+        row: Dict[str, Any] = {
+            "Part ID": part_id,
+            "Qty": qty,
+            "Status": "ok",
+            "Error": "",
+        }
+        try:
+            snap = fetch_part_snapshot(part_id)
+            unit_price = choose_unit_price(snap.price_tiers, qty)
+            ext = round(unit_price * qty, 6) if unit_price is not None else None
+
+            row["Name"] = snap.title or snap.description or ""
+            row["Manufacturer"] = snap.manufacturer or ""
+            row["MPN"] = snap.mpn or ""
+            row["Package"] = snap.package or ""
+            row["Stock"] = snap.stock if snap.stock is not None else ""
+            row["Unit Price USD"] = f"{unit_price:.6f}" if unit_price is not None else ""
+            row["Ext Cost USD"] = f"{ext:.6f}" if ext is not None else ""
+
+            if ext is not None:
+                total_cost += ext
+                cost_parts += 1
+            success_ids.append(part_id)
+        except Exception as exc:
+            log.exception("BOM lookup failed for %s", part_id)
+            row["Status"] = "error"
+            row["Error"] = str(exc)
+            errors.append(f"{part_id}: {exc}")
+        report_rows.append(row)
+
+    summary_lines = [
+        f"BOM summary ({source_label}):",
+        f"- Rows: {parsed.total_rows}",
+        f"- Matched rows: {parsed.matched_rows}",
+        f"- Unmatched rows: {parsed.unmatched_rows}",
+        f"- Unique parts processed: {len(selected_ids)}",
+    ]
+    if truncated > 0:
+        summary_lines.append(f"- Truncated: skipped {truncated} extra unique parts (BOM_MAX_PARTS={max_parts})")
+    if cost_parts > 0:
+        summary_lines.append(f"- Estimated total cost (USD): ${total_cost:.4f}")
+    else:
+        summary_lines.append("- Estimated total cost (USD): unavailable (missing price tiers)")
+    if errors:
+        summary_lines.append(f"- Parts with errors: {len(errors)}")
+    fc.send_text(chat_id, "\n".join(summary_lines))
+
+    try:
+        report_bytes = build_bom_report_csv(report_rows)
+        report_name = f"bom_report_{int(time.time())}.csv"
+        report_key = fc.upload_to_im_file(report_bytes, report_name, mime_type="text/csv")
+        fc.send_file(chat_id, report_key)
+    except Exception as exc:
+        log.exception("Failed sending BOM report file")
+        if _is_scope_denied_error(exc, ["im:resource:upload", "im:resource"]):
+            _send_file_upload_permission_hint(fc, chat_id)
+        else:
+            fc.send_text(chat_id, f"Failed to send BOM report file: {exc}")
+
+    generate_libs = (os.getenv("BOM_GENERATE_LIBS", "0") or "0").strip().lower() not in {"0", "false", "no", "off"}
+    if not generate_libs:
         return
-    if normalized.lower() in {"/ping", "ping"}:
-        fc.send_text(chat_id, "pong")
+    if not success_ids:
         return
 
-    mode, payload = _parse_request_mode(normalized)
+    max_libs = max(1, int(os.getenv("BOM_MAX_LIBS", "5")))
+    library_targets = success_ids[:max_libs]
+    fc.send_text(chat_id, f"Generating KiCad libraries for {len(library_targets)} BOM parts...")
+
+    bundled: Dict[str, bytes] = {}
+    lib_errors = []
+    for part_id in library_targets:
+        try:
+            _, archive_bytes = _fetch_component_library_archive(part_id)
+            bundled[part_id] = archive_bytes
+        except Exception as exc:
+            log.exception("Failed generating BOM library for %s", part_id)
+            lib_errors.append(f"{part_id}: {exc}")
+
+    if bundled:
+        try:
+            bundle_bytes = _bundle_library_archives(bundled)
+            bundle_name = f"bom_kicad_libraries_{int(time.time())}.zip"
+            bundle_key = fc.upload_to_im_file(bundle_bytes, bundle_name, mime_type="application/zip")
+            fc.send_file(chat_id, bundle_key)
+            fc.send_text(chat_id, f"Done. Sent {bundle_name}")
+        except Exception as exc:
+            log.exception("Failed sending BOM libraries bundle")
+            if _is_scope_denied_error(exc, ["im:resource:upload", "im:resource"]):
+                _send_file_upload_permission_hint(fc, chat_id)
+            else:
+                fc.send_text(chat_id, f"Failed to send BOM libraries bundle: {exc}")
+
+    if lib_errors:
+        fc.send_text(chat_id, "Some BOM libraries could not be generated: " + "; ".join(lib_errors[:5]))
+
+
+def _process_bom_text_command(fc: FeishuClient, chat_id: str, payload: str) -> None:
+    content = str(payload or "").strip()
+    if not content:
+        fc.send_text(
+            chat_id,
+            "Usage: /bom <rows> (one per line, or compact in one line like `C2040,10 C8596,5`), "
+            "or upload a CSV/XLSX file directly in this 1:1 chat.",
+        )
+        return
+    parsed = parse_bom_text(content, _extract_lcsc_id)
+    _process_bom_entries(fc, chat_id, parsed, source_label="text payload")
+
+
+def _process_bom_file_message(
+    fc: FeishuClient,
+    chat_id: str,
+    message_id: str,
+    content: Dict[str, Any],
+) -> None:
+    file_key = str(content.get("file_key") or "").strip()
+    file_name = str(content.get("file_name") or content.get("name") or "uploaded_bom").strip()
+    if not file_key:
+        fc.send_text(chat_id, "Could not read file metadata from message. Please resend the BOM file.")
+        return
+
+    fc.send_text(chat_id, f"Downloading BOM file `{file_name}`...")
+    try:
+        file_bytes = fc.download_message_resource(message_id=message_id, file_key=file_key, resource_type="file")
+    except Exception as exc:
+        log.exception("Failed downloading BOM message resource message_id=%s file_key=%s", message_id, file_key)
+        if _is_scope_denied_error(exc, ["im:message", "im:message.p2p_msg:readonly"]):
+            fc.send_text(
+                chat_id,
+                "Bot is missing Feishu permission to download message resources. "
+                "Please grant message read/resource scopes and publish app release.",
+            )
+            return
+        fc.send_text(chat_id, f"Failed to download BOM file: {exc}")
+        return
+
+    try:
+        parsed = parse_bom_bytes(file_bytes, file_name, _extract_lcsc_id)
+    except Exception as exc:
+        log.exception("Failed parsing BOM file %s", file_name)
+        fc.send_text(chat_id, f"Failed to parse BOM file `{file_name}`: {exc}")
+        return
+
+    _process_bom_entries(fc, chat_id, parsed, source_label=file_name)
+
+
+def _process_library_or_step_request(fc: FeishuClient, chat_id: str, text: str) -> None:
+    mode, payload = _parse_request_mode(text)
     if not payload:
         fc.send_text(chat_id, HELP_TEXT)
         return
@@ -326,16 +647,38 @@ def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
         else:
             log.exception("Failed generating KiCad library for %s", lcsc_id)
         if _is_scope_denied_error(exc, ["im:resource:upload", "im:resource"]):
-            fc.send_text(
-                chat_id,
-                "Bot is missing Feishu permission to upload files (`im:resource:upload` or `im:resource`). "
-                "Please enable permission and publish app release, then try again.",
-            )
+            _send_file_upload_permission_hint(fc, chat_id)
             return
         if mode == "step":
             fc.send_text(chat_id, f"Failed to download STEP for {lcsc_id}: {exc}")
         else:
             fc.send_text(chat_id, f"Failed to generate KiCad library for {lcsc_id}: {exc}")
+
+
+def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
+    normalized = str(text or "").strip()
+    if not normalized:
+        fc.send_text(chat_id, HELP_TEXT)
+        return
+
+    if normalized.lower() in {"/help", "help", "/start"}:
+        fc.send_text(chat_id, HELP_TEXT)
+        return
+    if normalized.lower() in {"/ping", "ping"}:
+        fc.send_text(chat_id, "pong")
+        return
+
+    if INFO_CMD_RE.match(normalized):
+        _process_info_command(fc, chat_id, _command_payload(normalized, "info"))
+        return
+    if COMPARE_CMD_RE.match(normalized):
+        _process_compare_command(fc, chat_id, _command_payload(normalized, "compare"))
+        return
+    if BOM_CMD_RE.match(normalized):
+        _process_bom_text_command(fc, chat_id, _command_payload(normalized, "bom"))
+        return
+
+    _process_library_or_step_request(fc, chat_id, normalized)
 
 
 def handle_p2_im_message_receive_v1(fc: FeishuClient, dedup: MessageDeduper, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -396,7 +739,11 @@ def handle_p2_im_message_receive_v1(fc: FeishuClient, dedup: MessageDeduper, dat
             _process_lcsc_request(fc, chat_id, " ".join(candidates))
             return
 
-        fc.send_text(chat_id, "Please send an LCSC link or ID as text.")
+        if msg_type == "file":
+            _process_bom_file_message(fc, chat_id, message_id=message_id, content=content)
+            return
+
+        fc.send_text(chat_id, "Please send text commands, part IDs/links, or a BOM CSV/XLSX file.")
     except Exception:
         log.exception("Unhandled error in message callback")
 
@@ -430,7 +777,7 @@ def handle_p2_im_chat_access_event_bot_p2p_chat_entered_v1(fc: FeishuClient, dat
         if chat_id:
             fc.send_text(
                 chat_id,
-                "Bot is online. Send an LCSC link or ID like C70078 for full KiCad library output. Use /help for commands.",
+                "Bot is online. Send an LCSC link/ID like C70078. Use /help for /info, /compare, /bom, /library, /step.",
             )
     except Exception:
         log.exception("Unhandled error in p2p-chat-entered callback")

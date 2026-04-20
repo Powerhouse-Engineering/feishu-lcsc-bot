@@ -3,4 +3,5 @@ python-dotenv==1.0.1
 requests==2.32.3
 easyeda2kicad==1.0.1
 KicadModTree
+openpyxl==3.1.5
 -e ./JLC2KiCad_lib-master

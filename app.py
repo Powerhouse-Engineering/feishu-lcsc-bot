@@ -39,6 +39,7 @@ PART_EXPLICIT_NUMERIC_RE = re.compile(
     r"\b(?:lcsc|jlcpcb)(?:[_\-\s]*(?:id|part(?:[_\-\s]*(?:number|no))?|pn))?\s*[:=#]?\s*([Cc]?\d{3,})\b",
     flags=re.IGNORECASE,
 )
+LCSC_SEARCH_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64)"
 
 
 HELP_TEXT = (
@@ -48,6 +49,7 @@ HELP_TEXT = (
     "- Show live part info (stock, price tiers, package, lifecycle)\n"
     "- Compare multiple parts side-by-side\n"
     "- Parse BOM from text, CSV, or XLSX file uploads\n"
+    "- Chat in natural language to find candidate parts with /chat\n"
     "- Accept LCSC/JLCPCB part IDs and LCSC/JLCPCB product links\n"
     "- Notify if no library/model is available for the requested part\n"
     "- KiCad output can be imported into Altium (direct Altium generation is not supported)\n"
@@ -59,6 +61,8 @@ HELP_TEXT = (
     "- /info <PART_ID> : show part info\n"
     "- /compare <PART_ID> <PART_ID> ... : compare parts\n"
     "- /bom <rows> : parse pasted BOM rows (or upload CSV/XLSX file)\n"
+    "- /chat <requirements> : natural-language component assistant\n"
+    "- /chat reset : clear chat context and start a fresh conversation\n"
     "- /step <PART_ID> : STEP-only output\n"
     "- /library <PART_ID> : force library ZIP output\n"
     "\n"
@@ -68,6 +72,8 @@ HELP_TEXT = (
     "- /compare C2040 C2871814 C8596\n"
     "- /bom C2040,10\\nC8596,5\n"
     "- /bom C2040,10 C8596,5 C7423108 x2\n"
+    "- /chat low iq 3.3V LDO in SOT-23 for battery design\n"
+    "- <plain follow-up text> continues current /chat session\n"
     "- https://www.lcsc.com/product-detail/..._C2040.html\n"
     "- jlcpcb part number 2040\n"
     "- https://jlcpcb.com/partdetail/.../C2040\n"
@@ -80,6 +86,10 @@ COMPARE_CMD_RE = re.compile(r"^/compare(\s|$)", flags=re.IGNORECASE)
 BOM_CMD_RE = re.compile(r"^/bom(\s|$)", flags=re.IGNORECASE)
 STEP_CMD_RE = re.compile(r"^/step(\s|$)", flags=re.IGNORECASE)
 LIBRARY_CMD_RE = re.compile(r"^/library(\s|$)", flags=re.IGNORECASE)
+CHAT_CMD_RE = re.compile(r"^/chat(\s|$)", flags=re.IGNORECASE)
+
+_CHAT_SESSION_LOCK = threading.Lock()
+_CHAT_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 def _is_scope_denied_error(exc: Exception, scope_tokens: List[str]) -> bool:
@@ -390,6 +400,558 @@ def _command_payload(text: str, command: str) -> str:
     return str(m.group(1) or "").strip()
 
 
+def _env_int(name: str, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    raw = str(os.getenv(name, str(default)) or str(default)).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _prune_chat_sessions() -> None:
+    ttl_sec = _env_int("CHAT_SESSION_TTL_SEC", 7200, minimum=300, maximum=604800)
+    max_chats = _env_int("CHAT_SESSION_MAX_CHATS", 500, minimum=50, maximum=5000)
+    now = time.time()
+    with _CHAT_SESSION_LOCK:
+        stale_keys = [
+            cid
+            for cid, sess in _CHAT_SESSIONS.items()
+            if now - float(sess.get("last_ts") or 0.0) > ttl_sec
+        ]
+        for cid in stale_keys:
+            _CHAT_SESSIONS.pop(cid, None)
+
+        if len(_CHAT_SESSIONS) > max_chats:
+            ordered = sorted(
+                _CHAT_SESSIONS.items(),
+                key=lambda kv: float((kv[1] or {}).get("last_ts") or 0.0),
+            )
+            drop_count = len(_CHAT_SESSIONS) - max_chats
+            for cid, _ in ordered[:drop_count]:
+                _CHAT_SESSIONS.pop(cid, None)
+
+
+def _get_chat_turns(chat_id: str) -> List[Dict[str, str]]:
+    _prune_chat_sessions()
+    key = str(chat_id or "").strip()
+    if not key:
+        return []
+    with _CHAT_SESSION_LOCK:
+        sess = _CHAT_SESSIONS.get(key)
+        if not sess:
+            return []
+        sess["last_ts"] = time.time()
+        turns = sess.get("turns") or []
+        if not isinstance(turns, list):
+            return []
+        out: List[Dict[str, str]] = []
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "").strip()
+            text = str(turn.get("text") or "").strip()
+            if role in {"user", "assistant"} and text:
+                out.append({"role": role, "text": text})
+        return out
+
+
+def _append_chat_turn(chat_id: str, role: str, text: str) -> None:
+    key = str(chat_id or "").strip()
+    val = str(text or "").strip()
+    if not key or role not in {"user", "assistant"} or not val:
+        return
+    _prune_chat_sessions()
+    max_turns = _env_int("CHAT_SESSION_MAX_TURNS", 8, minimum=2, maximum=40)
+    with _CHAT_SESSION_LOCK:
+        sess = _CHAT_SESSIONS.setdefault(key, {"turns": [], "last_ts": time.time()})
+        turns = sess.get("turns")
+        if not isinstance(turns, list):
+            turns = []
+        turns.append({"role": role, "text": val[:3000]})
+        max_items = max_turns * 2
+        if len(turns) > max_items:
+            turns = turns[-max_items:]
+        sess["turns"] = turns
+        sess["last_ts"] = time.time()
+
+
+def _reset_chat_session(chat_id: str) -> None:
+    key = str(chat_id or "").strip()
+    if not key:
+        return
+    with _CHAT_SESSION_LOCK:
+        _CHAT_SESSIONS.pop(key, None)
+
+
+def _has_chat_session(chat_id: str) -> bool:
+    return bool(_get_chat_turns(chat_id))
+
+
+def _looks_like_followup(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if len(value) <= 80:
+        return True
+    words = re.findall(r"[A-Za-z0-9._+-]+", value)
+    return len(words) <= 10
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        if "." in text:
+            return int(float(text))
+        return int(text)
+    except Exception:
+        return None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _extract_chat_candidates(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        part_id = str(item.get("productCode") or "").strip().upper()
+        if not re.fullmatch(r"C\d{3,}", part_id):
+            continue
+        if part_id in seen:
+            continue
+        seen.add(part_id)
+
+        product_url = str(item.get("url") or "").strip()
+        if product_url and product_url.startswith("/"):
+            product_url = f"https://www.lcsc.com{product_url}"
+        elif product_url and not product_url.lower().startswith("http"):
+            product_url = f"https://www.lcsc.com/{product_url.lstrip('/')}"
+        elif not product_url:
+            product_url = f"https://www.lcsc.com/product-detail/{part_id}.html"
+
+        datasheet_url = str(item.get("pdfLinkUrl") or item.get("pdfUrl") or "").strip() or None
+        if datasheet_url and datasheet_url.startswith("/"):
+            datasheet_url = f"https://www.lcsc.com{datasheet_url}"
+
+        tiers: List[Dict[str, Any]] = []
+        raw_tiers = item.get("productPriceList") or []
+        if isinstance(raw_tiers, list):
+            for tier in raw_tiers:
+                if not isinstance(tier, dict):
+                    continue
+                ladder = _int_or_none(tier.get("ladder"))
+                price = _float_or_none(tier.get("usdPrice"))
+                if price is None:
+                    price = _float_or_none(tier.get("currencyPrice"))
+                if price is None:
+                    price = _float_or_none(tier.get("productPrice"))
+                if ladder is None or price is None or ladder <= 0 or price < 0:
+                    continue
+                tiers.append({"ladder": ladder, "unit_price_usd": price})
+        tiers.sort(key=lambda x: int(x["ladder"]))
+        deduped_tiers: List[Dict[str, Any]] = []
+        seen_ladder: Set[int] = set()
+        for tier in tiers:
+            ladder = int(tier["ladder"])
+            if ladder in seen_ladder:
+                continue
+            seen_ladder.add(ladder)
+            deduped_tiers.append(tier)
+
+        out.append(
+            {
+                "part_id": part_id,
+                "mpn": str(item.get("productModel") or "").strip() or None,
+                "title": str(item.get("title") or item.get("productNameEn") or "").strip() or None,
+                "brand": str(item.get("brandNameEn") or "").strip() or None,
+                "package": str(item.get("encapStandard") or "").strip() or None,
+                "category": str(item.get("parentCatalogName") or "").strip() or None,
+                "intro": str(item.get("productIntroEn") or "").strip() or None,
+                "stock": _int_or_none(item.get("stockNumber")),
+                "min_order_qty": _int_or_none(item.get("minBuyNumber")),
+                "lifecycle": str(item.get("productCycle") or "").strip() or None,
+                "price_tiers": deduped_tiers[:6],
+                "product_url": product_url,
+                "datasheet_url": datasheet_url,
+            }
+        )
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _search_lcsc_candidates(keyword: str, page_size: int = 20, timeout_sec: int = 25) -> Tuple[List[Dict[str, Any]], int]:
+    resp = requests.post(
+        "https://wmsc.lcsc.com/ftps/wm/search/v2/global",
+        json={"keyword": keyword, "currentPage": 1, "pageSize": page_size},
+        headers={
+            "User-Agent": LCSC_SEARCH_USER_AGENT,
+            "Content-Type": "application/json",
+            "Referer": "https://www.lcsc.com/",
+        },
+        timeout=max(8, int(timeout_sec)),
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"LCSC search failed with HTTP {resp.status_code}")
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        raise RuntimeError("LCSC search returned invalid JSON") from exc
+
+    if int(payload.get("code") or 0) != 200:
+        raise RuntimeError(f"LCSC search error: {payload.get('msg') or payload}")
+
+    result = payload.get("result") or {}
+    search_result = result.get("productSearchResultVO") or {}
+    raw_items = search_result.get("productList") or []
+    total_count = _int_or_none(search_result.get("totalCount")) or 0
+    if not isinstance(raw_items, list):
+        return [], total_count
+    candidates = _extract_chat_candidates(raw_items, limit=page_size)
+    return candidates, total_count
+
+
+def _chat_query_tokens(query: str) -> List[str]:
+    stop = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "need",
+        "want",
+        "used",
+        "using",
+        "design",
+        "application",
+        "project",
+        "circuit",
+        "board",
+        "battery",
+        "powered",
+        "power",
+    }
+    tokens = []
+    for tok in re.findall(r"[a-zA-Z0-9.+/_-]{2,}", query.lower()):
+        if tok in stop:
+            continue
+        tokens.append(tok)
+    # Keep order, dedupe, and cap prompt complexity.
+    seen: Set[str] = set()
+    out: List[str] = []
+    for tok in tokens:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _build_chat_search_variants(query: str) -> List[str]:
+    normalized = " ".join(str(query or "").split()).strip()
+    if not normalized:
+        return []
+    variants = [normalized]
+
+    low = normalized.lower()
+    for marker in [" for ", " used in ", " used for ", " in ", " to "]:
+        idx = low.find(marker)
+        if idx > 8:
+            variants.append(normalized[:idx].strip())
+
+    # Keep mostly technical tokens to reduce noisy context terms.
+    tech_tokens = _chat_query_tokens(normalized)
+    if tech_tokens:
+        variants.append(" ".join(tech_tokens))
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for variant in variants:
+        key = variant.lower()
+        if key in seen or len(variant) < 3:
+            continue
+        seen.add(key)
+        out.append(variant)
+    return out[:4]
+
+
+def _score_chat_candidate_set(candidates: List[Dict[str, Any]], query_tokens: List[str]) -> float:
+    if not candidates:
+        return 0.0
+    if not query_tokens:
+        return float(len(candidates))
+    score = 0.0
+    for cand in candidates[:10]:
+        hay = " ".join(
+            [
+                str(cand.get("title") or ""),
+                str(cand.get("mpn") or ""),
+                str(cand.get("intro") or ""),
+                str(cand.get("category") or ""),
+                str(cand.get("package") or ""),
+            ]
+        ).lower()
+        matched = 0
+        for tok in query_tokens:
+            if tok in hay:
+                matched += 1
+        score += matched
+    return score
+
+
+def _format_price_tiers_compact(tiers: List[Dict[str, Any]]) -> str:
+    if not tiers:
+        return "n/a"
+    parts = []
+    for tier in tiers[:3]:
+        ladder = _int_or_none(tier.get("ladder"))
+        price = _float_or_none(tier.get("unit_price_usd"))
+        if ladder is None or price is None:
+            continue
+        parts.append(f"{ladder}+ @ ${price:.4f}")
+    return ", ".join(parts) if parts else "n/a"
+
+
+def _build_chat_fallback_reply(query: str, candidates: List[Dict[str, Any]], total_count: int) -> str:
+    max_results = _env_int("CHAT_MAX_RESULTS", 5, minimum=1, maximum=10)
+    selected = candidates[:max_results]
+    lines = [f"Search results for: {query}"]
+    if total_count > 0:
+        lines.append(f"LCSC matches: {total_count}. Showing top {len(selected)}.")
+    else:
+        lines.append(f"Showing top {len(selected)} candidates.")
+    lines.append("")
+    for idx, cand in enumerate(selected, start=1):
+        stock = cand.get("stock")
+        stock_text = str(stock) if stock is not None else "n/a"
+        moq = cand.get("min_order_qty")
+        moq_text = str(moq) if moq is not None else "n/a"
+        lines.append(
+            f"{idx}. {cand.get('part_id')} | {cand.get('mpn') or '-'} | {cand.get('brand') or '-'} | "
+            f"{cand.get('package') or '-'} | Stock {stock_text} | MOQ {moq_text}"
+        )
+        lines.append(f"   Price tiers: {_format_price_tiers_compact(cand.get('price_tiers') or [])}")
+    lines.append("")
+    lines.append("Use /info Cxxxx for full details, /library Cxxxx for KiCad library, and /step Cxxxx for STEP.")
+    return "\n".join(lines)
+
+
+def _run_claude_component_chat(
+    query: str,
+    candidates: List[Dict[str, Any]],
+    history_turns: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    api_key = (os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
+    model = (os.getenv("ANTHROPIC_MODEL", "claude-sonnet") or "claude-sonnet").strip()
+    if not api_key:
+        raise RuntimeError("Missing ANTHROPIC_API_KEY")
+
+    max_results = _env_int("CHAT_MAX_RESULTS", 5, minimum=1, maximum=10)
+    pool = _env_int("CHAT_AI_POOL", 12, minimum=max_results, maximum=30)
+    prompt_candidates = []
+    for cand in candidates[:pool]:
+        prompt_candidates.append(
+            {
+                "part_id": cand.get("part_id"),
+                "title": cand.get("title"),
+                "mpn": cand.get("mpn"),
+                "brand": cand.get("brand"),
+                "package": cand.get("package"),
+                "category": cand.get("category"),
+                "intro": cand.get("intro"),
+                "stock": cand.get("stock"),
+                "min_order_qty": cand.get("min_order_qty"),
+                "lifecycle": cand.get("lifecycle"),
+                "price_tiers": cand.get("price_tiers"),
+                "product_url": cand.get("product_url"),
+            }
+        )
+
+    history_payload: List[Dict[str, str]] = []
+    for turn in history_turns or []:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role") or "").strip()
+        text = str(turn.get("text") or "").strip()
+        if role not in {"user", "assistant"} or not text:
+            continue
+        history_payload.append({"role": role, "text": text[:600]})
+    history_payload = history_payload[-8:]
+
+    prompt = (
+        "You are an electronics component assistant focused on LCSC/JLCPCB selection.\n"
+        f"User request: {query}\n"
+        f"Select up to {max_results} best matches from the candidate list.\n"
+        "Rules:\n"
+        "1) Use ONLY part_ids from the provided candidates.\n"
+        "2) Prefer good requirement fit, in-stock parts, and realistic MOQ/price.\n"
+        "3) Mention one tradeoff or risk per suggested part.\n"
+        "4) If the request is underspecified, state assumptions and ask one concise follow-up question.\n"
+        "Output format (plain text only):\n"
+        "Summary: <1-2 lines>\n"
+        "1) Cxxxx - <why it fits>\n"
+        "   MPN: ... | Package: ... | Stock: ... | Price: ...\n"
+        "   Tradeoff: ...\n"
+        "2) ...\n"
+        "Follow-up: <single question>\n"
+        "Previous chat turns JSON (if any):\n"
+        + json.dumps(history_payload, ensure_ascii=False)
+        + "\n"
+        "Candidate list JSON:\n"
+        + json.dumps(prompt_candidates, ensure_ascii=False)
+    )
+
+    payload = {
+        "model": model,
+        "max_tokens": 900,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    }
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    resp = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=120)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Claude API failed {resp.status_code}: {resp.text[:400]}")
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise RuntimeError("Claude API returned invalid JSON") from exc
+
+    text_parts: List[str] = []
+    for chunk in data.get("content") or []:
+        if isinstance(chunk, dict) and chunk.get("type") == "text":
+            text = str(chunk.get("text") or "").strip()
+            if text:
+                text_parts.append(text)
+    answer = "\n".join(text_parts).strip()
+    if not answer:
+        raise RuntimeError("Claude returned an empty response")
+    return answer
+
+
+def _process_chat_command(fc: FeishuClient, chat_id: str, payload: str) -> None:
+    query = str(payload or "").strip()
+    if not query:
+        fc.send_text(
+            chat_id,
+            "Usage: /chat <requirements> (or /chat reset). Example: /chat low iq 3.3V LDO in SOT-23 for battery design",
+        )
+        return
+
+    lower_query = query.lower()
+    if lower_query in {"reset", "clear", "new"}:
+        _reset_chat_session(chat_id)
+        fc.send_text(chat_id, "Chat context reset. Send /chat <requirements> to start again.")
+        return
+
+    continue_mode = True
+    if lower_query.startswith("new "):
+        _reset_chat_session(chat_id)
+        query = query[4:].strip()
+        continue_mode = False
+        if not query:
+            fc.send_text(chat_id, "Usage: /chat new <requirements>")
+            return
+
+    history_turns = _get_chat_turns(chat_id) if continue_mode else []
+    prior_user_msgs = [t.get("text", "") for t in history_turns if t.get("role") == "user"]
+    search_query = query
+    if prior_user_msgs and _looks_like_followup(query):
+        search_query = f"{prior_user_msgs[-1]} {query}".strip()
+
+    search_pool = _env_int("CHAT_SEARCH_POOL", 20, minimum=5, maximum=50)
+    search_variants = _build_chat_search_variants(search_query)
+    if not search_variants:
+        fc.send_text(chat_id, "Please provide some component requirements after /chat.")
+        return
+    fc.send_text(chat_id, f"Searching LCSC for: {search_variants[0]}")
+
+    query_tokens = _chat_query_tokens(search_query)
+    candidates: List[Dict[str, Any]] = []
+    total_count = 0
+    best_score = -1.0
+    best_variant = search_variants[0]
+    search_errors = []
+    for variant in search_variants:
+        try:
+            cands, total = _search_lcsc_candidates(variant, page_size=search_pool)
+        except Exception as exc:
+            search_errors.append(str(exc))
+            continue
+        score = _score_chat_candidate_set(cands, query_tokens)
+        if score > best_score:
+            best_score = score
+            best_variant = variant
+            candidates = cands
+            total_count = total
+
+    if not candidates and search_errors:
+        detail = "; ".join(search_errors[:2])
+        log.warning("LCSC search failed for /chat query=%s errors=%s", query, detail)
+        fc.send_text(chat_id, f"LCSC search failed: {detail}")
+        return
+
+    if not candidates:
+        fc.send_text(
+            chat_id,
+            "No matching parts found for that query. Try adding key constraints like voltage, package, tolerance, or current.",
+        )
+        return
+    if best_variant.lower() != search_variants[0].lower():
+        fc.send_text(chat_id, f"Using refined search keywords: {best_variant}")
+
+    api_key = (os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
+    if api_key:
+        fc.send_text(chat_id, "Ranking candidates with AI...")
+        try:
+            answer = _run_claude_component_chat(search_query, candidates, history_turns=history_turns)
+            fc.send_text(chat_id, answer)
+            _append_chat_turn(chat_id, "user", query)
+            _append_chat_turn(chat_id, "assistant", answer)
+            return
+        except Exception as exc:
+            log.exception("Claude ranking failed for /chat query=%s", query)
+            fc.send_text(chat_id, f"AI ranking unavailable right now ({exc}). Sending deterministic shortlist.")
+    else:
+        log.info("ANTHROPIC_API_KEY is not set; /chat using deterministic shortlist")
+
+    fallback = _build_chat_fallback_reply(search_query, candidates, total_count)
+    fc.send_text(chat_id, fallback)
+    _append_chat_turn(chat_id, "user", query)
+    _append_chat_turn(chat_id, "assistant", fallback)
+
+
 def _send_file_upload_permission_hint(fc: FeishuClient, chat_id: str) -> None:
     fc.send_text(
         chat_id,
@@ -453,9 +1015,11 @@ def _process_bom_entries(fc: FeishuClient, chat_id: str, parsed: BomParseResult,
         fc.send_text(chat_id, message)
         return
 
-    max_parts = max(1, int(os.getenv("BOM_MAX_PARTS", "20")))
+    max_parts = max(1, int(os.getenv("BOM_MAX_PARTS", "500")))
+    detail_limit = max(1, int(os.getenv("BOM_DETAIL_LIMIT", "25")))
     selected_ids = list(parsed.entries.keys())[:max_parts]
-    truncated = len(parsed.entries) - len(selected_ids)
+    skipped_ids = list(parsed.entries.keys())[max_parts:]
+    truncated = len(skipped_ids)
     fc.send_text(chat_id, f"Processing BOM: {len(selected_ids)} unique parts from {source_label}...")
 
     report_rows: List[Dict[str, Any]] = []
@@ -512,6 +1076,24 @@ def _process_bom_entries(fc: FeishuClient, chat_id: str, parsed: BomParseResult,
     if errors:
         summary_lines.append(f"- Parts with errors: {len(errors)}")
     fc.send_text(chat_id, "\n".join(summary_lines))
+
+    if skipped_ids:
+        skipped_preview = ", ".join(skipped_ids[:detail_limit])
+        if len(skipped_ids) > detail_limit:
+            skipped_preview += f", ... (+{len(skipped_ids) - detail_limit} more)"
+        fc.send_text(chat_id, f"Skipped part IDs due BOM_MAX_PARTS limit:\n{skipped_preview}")
+
+    if parsed.unmatched_examples:
+        unmatched_preview = parsed.unmatched_examples[:detail_limit]
+        suffix = ""
+        if len(parsed.unmatched_examples) > detail_limit:
+            suffix = f"\n... (+{len(parsed.unmatched_examples) - detail_limit} more unmatched rows)"
+        fc.send_text(
+            chat_id,
+            "Unmatched BOM rows (no valid LCSC/JLCPCB part ID detected):\n"
+            + "\n".join(unmatched_preview)
+            + suffix,
+        )
 
     try:
         report_bytes = build_bom_report_csv(report_rows)
@@ -677,6 +1259,14 @@ def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
     if BOM_CMD_RE.match(normalized):
         _process_bom_text_command(fc, chat_id, _command_payload(normalized, "bom"))
         return
+    if CHAT_CMD_RE.match(normalized):
+        _process_chat_command(fc, chat_id, _command_payload(normalized, "chat"))
+        return
+
+    # If a /chat session is active, treat plain follow-up text as chat continuation.
+    if _has_chat_session(chat_id) and not normalized.startswith("/") and not _extract_lcsc_id(normalized):
+        _process_chat_command(fc, chat_id, normalized)
+        return
 
     _process_library_or_step_request(fc, chat_id, normalized)
 
@@ -777,7 +1367,7 @@ def handle_p2_im_chat_access_event_bot_p2p_chat_entered_v1(fc: FeishuClient, dat
         if chat_id:
             fc.send_text(
                 chat_id,
-                "Bot is online. Send an LCSC link/ID like C70078. Use /help for /info, /compare, /bom, /library, /step.",
+                "Bot is online. Send an LCSC link/ID like C70078. Use /help for /info, /compare, /bom, /chat, /library, /step.",
             )
     except Exception:
         log.exception("Unhandled error in p2p-chat-entered callback")
@@ -863,6 +1453,8 @@ def main() -> None:
     dedup_capacity = int(os.getenv("DEDUP_CAPACITY", "3000"))
     ws_log_level_name = (os.getenv("FEISHU_WS_LOG_LEVEL", "INFO") or "INFO").strip().upper()
     ws_log_level = getattr(lark.LogLevel, ws_log_level_name, lark.LogLevel.INFO)
+    anthropic_key = (os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
+    anthropic_model = (os.getenv("ANTHROPIC_MODEL", "claude-sonnet") or "claude-sonnet").strip()
 
     if not app_id or not app_secret:
         raise RuntimeError("Missing required env: FEISHU_APP_ID and FEISHU_APP_SECRET")
@@ -870,6 +1462,11 @@ def main() -> None:
     log.info("Starting Feishu LCSC bot")
     log.info("Using FEISHU_APP_ID=%s***", app_id[:6] if len(app_id) > 6 else app_id)
     log.info("Using FEISHU_WS_LOG_LEVEL=%s", ws_log_level_name)
+    log.info(
+        "Using /chat AI ranking=%s model=%s",
+        "enabled" if anthropic_key else "disabled",
+        anthropic_model,
+    )
 
     fc = FeishuClient(app_id, app_secret)
     log_scope_diagnostics(fc)

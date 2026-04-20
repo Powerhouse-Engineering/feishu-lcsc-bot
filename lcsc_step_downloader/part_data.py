@@ -54,6 +54,7 @@ class BomParseResult:
     total_rows: int
     matched_rows: int
     unmatched_rows: int
+    unmatched_examples: List[str]
     notes: List[str]
 
 
@@ -512,6 +513,33 @@ def _extract_quantity_from_row(row: Dict[str, str]) -> int:
     return 1
 
 
+def _summarize_unmatched_row(row_idx: int, row: Dict[str, str]) -> str:
+    preferred_keys = [
+        key
+        for key in row.keys()
+        if re.search(
+            r"(lcsc|jlcpcb|part|supplier|mpn|model|item|description|comment|value)",
+            key,
+            flags=re.IGNORECASE,
+        )
+    ]
+    ordered_keys = preferred_keys or list(row.keys())
+    details: List[str] = []
+    for key in ordered_keys:
+        value = str(row.get(key) or "").strip()
+        if not value:
+            continue
+        snippet = value[:60]
+        if len(value) > 60:
+            snippet += "..."
+        details.append(f"{key}={snippet}")
+        if len(details) >= 3:
+            break
+    if details:
+        return f"Row {row_idx}: " + "; ".join(details)
+    return f"Row {row_idx}: (empty or unsupported values)"
+
+
 def parse_bom_bytes(
     file_bytes: bytes,
     file_name: str,
@@ -530,8 +558,9 @@ def parse_bom_bytes(
     total_rows = len(row_dicts)
     matched_rows = 0
     unmatched_rows = 0
+    unmatched_examples: List[str] = []
 
-    for row in row_dicts:
+    for row_idx, row in enumerate(row_dicts, start=1):
         part_id = None
         preferred_keys = [
             key
@@ -545,6 +574,8 @@ def parse_bom_bytes(
                 break
         if not part_id:
             unmatched_rows += 1
+            if len(unmatched_examples) < 40:
+                unmatched_examples.append(_summarize_unmatched_row(row_idx, row))
             continue
         qty = _extract_quantity_from_row(row)
         entries[part_id] = int(entries.get(part_id, 0)) + max(1, qty)
@@ -557,6 +588,7 @@ def parse_bom_bytes(
         total_rows=total_rows,
         matched_rows=matched_rows,
         unmatched_rows=unmatched_rows,
+        unmatched_examples=unmatched_examples,
         notes=notes,
     )
 
@@ -566,6 +598,7 @@ def parse_bom_text(payload: str, id_extractor: Any) -> BomParseResult:
     entries: Dict[str, int] = {}
     matched = 0
     unmatched = 0
+    unmatched_examples: List[str] = []
 
     def _extract_qty(text: str) -> int:
         qty_match = re.search(r"(?:qty|quantity|x|[*,:=])\s*(\d+)", text, flags=re.IGNORECASE)
@@ -573,7 +606,7 @@ def parse_bom_text(payload: str, id_extractor: Any) -> BomParseResult:
             return 1
         return max(1, int(qty_match.group(1)))
 
-    for line in lines:
+    for line_idx, line in enumerate(lines, start=1):
         # Support compact multi-part lines like:
         # C2040,10 C8596,5 C7423108 x2
         compact_hits = list(re.finditer(r"(?<![A-Za-z0-9])[Cc](\d{3,})(?![A-Za-z0-9])", line))
@@ -590,6 +623,11 @@ def parse_bom_text(payload: str, id_extractor: Any) -> BomParseResult:
         pid = id_extractor(line)
         if not pid:
             unmatched += 1
+            if len(unmatched_examples) < 40:
+                snippet = line[:100]
+                if len(line) > 100:
+                    snippet += "..."
+                unmatched_examples.append(f"Row {line_idx}: {snippet}")
             continue
         qty = _extract_qty(line)
         entries[pid] = int(entries.get(pid, 0)) + qty
@@ -603,6 +641,7 @@ def parse_bom_text(payload: str, id_extractor: Any) -> BomParseResult:
         total_rows=len(lines),
         matched_rows=matched,
         unmatched_rows=unmatched,
+        unmatched_examples=unmatched_examples,
         notes=notes,
     )
 

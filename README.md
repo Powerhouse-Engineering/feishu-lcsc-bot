@@ -16,6 +16,9 @@ User sends an LCSC link or ID (for example `C2040`), bot replies with a KiCad co
 - Supports `/info` to return live part info (stock, pricing tiers, package, lifecycle).
 - Supports `/compare` to compare multiple parts side-by-side.
 - Supports `/bom` via pasted text and CSV/XLSX uploads.
+- Supports `/chat` natural-language component search assistant.
+  - Use `/chat reset` to clear context.
+  - Plain follow-up text (without `/chat`) continues active chat context.
 - Supports optional STEP-only mode with `/step Cxxxx`.
 - Rejects group chats (only `p2p`).
 
@@ -65,9 +68,18 @@ Optional:
 - `STEP_BACKEND_ORDER` (default `easyeda2kicad,jlc2kicad`, only used for `/step` mode)
 - `NODE_BIN` (optional absolute path to Node.js, useful under systemd when Node is installed via `nvm`)
 - `COMPARE_MAX_PARTS` (default `5`)
-- `BOM_MAX_PARTS` (default `20`)
+- `BOM_MAX_PARTS` (default `500`)
+- `BOM_DETAIL_LIMIT` (default `25`, limits how many skipped/unmatched details are sent in chat)
 - `BOM_GENERATE_LIBS` (default `0`)
 - `BOM_MAX_LIBS` (default `5`)
+- `ANTHROPIC_API_KEY` (optional, enables AI ranking/suggestions for `/chat`)
+- `ANTHROPIC_MODEL` (default `claude-sonnet`)
+- `CHAT_SEARCH_POOL` (default `20`, max candidates fetched from LCSC search endpoint)
+- `CHAT_AI_POOL` (default `12`, candidates passed to Claude for ranking)
+- `CHAT_MAX_RESULTS` (default `5`, items returned to user)
+- `CHAT_SESSION_TTL_SEC` (default `7200`, how long chat context is kept per 1:1 chat)
+- `CHAT_SESSION_MAX_TURNS` (default `8`, user/assistant turn pairs retained for context)
+- `CHAT_SESSION_MAX_CHATS` (default `500`, max active chat contexts in memory)
 
 ## Reusing Existing Credentials From `feishu-expense-bot`
 
@@ -121,3 +133,6 @@ tail -f "/home/santilopez10/Feishu Bot/Feishu LCSC bot/logs/bot.log"
 5. Send `/compare C2040 C8596` and confirm compare summary.
 6. Send `/bom C2040,10` or upload a BOM CSV/XLSX file in the chat and confirm report generation.
 7. Optional: send `/step C2040` to request STEP-only output.
+8. Optional: send `/chat low iq 3.3V LDO in SOT-23` and confirm shortlist response.
+9. Optional: reply with plain text (for example `max current 150mA`) and confirm it continues the same `/chat` context.
+10. Optional: send `/chat reset` and confirm context is cleared.

@@ -1,0 +1,17 @@
+[Unit]
+Description=Feishu LCSC STEP Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{APP_USER}}
+WorkingDirectory={{APP_DIR}}
+EnvironmentFile={{APP_DIR}}/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/bash -lc 'cd "{{APP_DIR}}" && exec .venv/bin/python app.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

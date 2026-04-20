@@ -2,3 +2,5 @@ lark-oapi==1.5.3
 python-dotenv==1.0.1
 requests==2.32.3
 easyeda2kicad==1.0.1
+KicadModTree
+-e ./JLC2KiCad_lib-master

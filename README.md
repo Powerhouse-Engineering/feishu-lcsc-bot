@@ -1,7 +1,7 @@
 # Feishu LCSC Bot
 
 Feishu bot for 1:1 chat.  
-User sends an LCSC link or ID (for example `C2040`), bot replies with the `.step` file.
+User sends an LCSC link or ID (for example `C2040`), bot replies with a KiCad component library `.zip` file (symbol, footprint, 3D model).
 
 ## What This Bot Does
 
@@ -10,8 +10,10 @@ User sends an LCSC link or ID (for example `C2040`), bot replies with the `.step
 - Extracts LCSC ID from:
   - direct ID (`C12345`)
   - LCSC links containing that ID
-- Downloads STEP model via shared code in `lcsc_step_downloader/core.py` (used by both bot and downloader web app).
-- Uploads the file to Feishu IM and sends it back in chat.
+- Generates KiCad symbol/footprint/3D model by invoking local `JLC2KiCad_lib-master`.
+- Packages generated files as a `.zip`.
+- Uploads the archive to Feishu IM and sends it back in chat.
+- Supports optional STEP-only mode with `/step Cxxxx`.
 - Rejects group chats (only `p2p`).
 
 ## Files Added For Server Hosting
@@ -55,6 +57,8 @@ Optional:
 - `LOG_LEVEL` (default `INFO`)
 - `LOG_PATH` (default `logs/bot.log`)
 - `DEDUP_CAPACITY` (default `3000`)
+- `KICAD_LIBRARY_MODELS` (default `STEP`, accepted values: `STEP`, `WRL`, or both like `STEP WRL`)
+- `STEP_BACKEND_ORDER` (default `easyeda2kicad,jlc2kicad`, only used for `/step` mode)
 
 ## Reusing Existing Credentials From `feishu-expense-bot`
 
@@ -102,5 +106,6 @@ tail -f "/home/santilopez10/Feishu Bot/Feishu LCSC bot/logs/bot.log"
 ## Smoke Test
 
 1. Open 1:1 chat with the bot in Feishu.
-2. Send `C2040` (or any valid LCSC component ID with STEP model).
-3. Confirm bot sends back a `.step` file.
+2. Send `C2040` (or any valid LCSC component ID / product link).
+3. Confirm bot sends back a `.zip` with KiCad library files.
+4. Optional: send `/step C2040` to request STEP-only output.

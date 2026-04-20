@@ -46,6 +46,7 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
 fi
 
 echo "[deploy] installing python dependencies"
+cd "${APP_DIR}"
 "${VENV_DIR}/bin/pip" install --upgrade pip
 "${VENV_DIR}/bin/pip" install -r "${REQ_FILE}"
 

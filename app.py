@@ -10,7 +10,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import lark_oapi as lark
 import requests
-from lcsc_step_downloader.core import fetch_step_file
+from lcsc_step_downloader.core import fetch_component_library_archive, fetch_step_file
 
 try:
     from dotenv import load_dotenv
@@ -26,10 +26,13 @@ LCSC_EXPLICIT_NUMERIC_RE = re.compile(r"\blcsc(?:[_\-\s]*id)?\s*[:=#]?\s*(\d{3,}
 
 
 HELP_TEXT = (
-    "Send an LCSC link or LCSC ID and I will return the STEP file.\n"
+    "Send an LCSC link or LCSC ID and I will return a KiCad library ZIP "
+    "(symbol + footprint + 3D model).\n"
+    "Optional: use `/step Cxxxx` for STEP-only output.\n"
     "Examples:\n"
     "- C2040\n"
-    "- https://www.lcsc.com/product-detail/..._C2040.html"
+    "- https://www.lcsc.com/product-detail/..._C2040.html\n"
+    "- /step C2040"
 )
 
 
@@ -229,6 +232,22 @@ def _fetch_step_file(lcsc_id: str) -> Tuple[str, bytes]:
     return fetch_step_file(lcsc_id)
 
 
+def _fetch_component_library_archive(lcsc_id: str) -> Tuple[str, bytes]:
+    return fetch_component_library_archive(lcsc_id)
+
+
+def _parse_request_mode(text: str) -> Tuple[str, str]:
+    normalized = str(text or "").strip()
+    low = normalized.lower()
+    if re.match(r"^/step(\s|$)", low):
+        return "step", normalized[len("/step") :].strip()
+    if re.match(r"^step(\s|$)", low):
+        return "step", normalized[len("step") :].strip()
+    if re.match(r"^/library(\s|$)", low):
+        return "library", normalized[len("/library") :].strip()
+    return "library", normalized
+
+
 def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
     normalized = str(text or "").strip()
     if not normalized:
@@ -242,7 +261,12 @@ def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
         fc.send_text(chat_id, "pong")
         return
 
-    lcsc_id = _extract_lcsc_id(normalized)
+    mode, payload = _parse_request_mode(normalized)
+    if not payload:
+        fc.send_text(chat_id, HELP_TEXT)
+        return
+
+    lcsc_id = _extract_lcsc_id(payload)
     if not lcsc_id:
         fc.send_text(
             chat_id,
@@ -250,14 +274,24 @@ def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
         )
         return
 
-    fc.send_text(chat_id, f"Fetching STEP file for {lcsc_id}...")
     try:
-        file_name, step_bytes = _fetch_step_file(lcsc_id)
-        file_key = fc.upload_to_im_file(step_bytes, file_name, mime_type="application/step")
+        if mode == "step":
+            fc.send_text(chat_id, f"Fetching STEP file for {lcsc_id}...")
+            file_name, file_bytes = _fetch_step_file(lcsc_id)
+            mime_type = "application/step"
+        else:
+            fc.send_text(chat_id, f"Generating KiCad component library for {lcsc_id}...")
+            file_name, file_bytes = _fetch_component_library_archive(lcsc_id)
+            mime_type = "application/zip"
+
+        file_key = fc.upload_to_im_file(file_bytes, file_name, mime_type=mime_type)
         fc.send_file(chat_id, file_key)
         fc.send_text(chat_id, f"Done. Sent {file_name}")
     except Exception as exc:
-        log.exception("Failed generating STEP for %s", lcsc_id)
+        if mode == "step":
+            log.exception("Failed generating STEP for %s", lcsc_id)
+        else:
+            log.exception("Failed generating KiCad library for %s", lcsc_id)
         if _is_scope_denied_error(exc, ["im:resource:upload", "im:resource"]):
             fc.send_text(
                 chat_id,
@@ -265,7 +299,10 @@ def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
                 "Please enable permission and publish app release, then try again.",
             )
             return
-        fc.send_text(chat_id, f"Failed to download STEP for {lcsc_id}: {exc}")
+        if mode == "step":
+            fc.send_text(chat_id, f"Failed to download STEP for {lcsc_id}: {exc}")
+        else:
+            fc.send_text(chat_id, f"Failed to generate KiCad library for {lcsc_id}: {exc}")
 
 
 def handle_p2_im_message_receive_v1(fc: FeishuClient, dedup: MessageDeduper, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -358,7 +395,7 @@ def handle_p2_im_chat_access_event_bot_p2p_chat_entered_v1(fc: FeishuClient, dat
             (operator_id[:8] + "***") if operator_id else "-",
         )
         if chat_id:
-            fc.send_text(chat_id, "Bot is online. Send an LCSC link or ID like C70078.")
+            fc.send_text(chat_id, "Bot is online. Send an LCSC link or ID like C70078 for full KiCad library output.")
     except Exception:
         log.exception("Unhandled error in p2p-chat-entered callback")
 
@@ -423,7 +460,7 @@ def log_scope_diagnostics(fc: FeishuClient) -> None:
     if not upload_scope_ok:
         log.warning(
             "Missing file-upload scope: enable `im:resource:upload` (or `im:resource`) "
-            "to allow sending STEP files via /im/v1/files."
+            "to allow sending generated files via /im/v1/files."
         )
 
     if missing_optional:

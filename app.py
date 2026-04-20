@@ -22,17 +22,35 @@ log = logging.getLogger("feishu-lcsc-bot")
 
 
 LCSC_ID_RE = re.compile(r"(?<![A-Za-z0-9])[Cc]\d{3,}(?![A-Za-z0-9])")
-LCSC_EXPLICIT_NUMERIC_RE = re.compile(r"\blcsc(?:[_\-\s]*id)?\s*[:=#]?\s*(\d{3,})\b", flags=re.IGNORECASE)
+PART_PREFIXED_SPACED_RE = re.compile(r"(?<![A-Za-z0-9])[Cc]\s*(\d{3,})(?![A-Za-z0-9])")
+PART_EXPLICIT_NUMERIC_RE = re.compile(
+    r"\b(?:lcsc|jlcpcb)(?:[_\-\s]*(?:id|part(?:[_\-\s]*(?:number|no))?|pn))?\s*[:=#]?\s*([Cc]?\d{3,})\b",
+    flags=re.IGNORECASE,
+)
 
 
 HELP_TEXT = (
-    "Send an LCSC link or LCSC ID and I will return a KiCad library ZIP "
-    "(symbol + footprint + 3D model).\n"
-    "Optional: use `/step Cxxxx` for STEP-only output.\n"
+    "LCSC/JLCPCB Bot capabilities:\n"
+    "- Generate full KiCad library ZIP (symbol + footprint + 3D model)\n"
+    "- Generate STEP-only file on request\n"
+    "- Accept LCSC/JLCPCB part IDs and LCSC/JLCPCB product links\n"
+    "- Notify if no library/model is available for the requested part\n"
+    "- KiCad output can be imported into Altium (direct Altium generation is not supported)\n"
+    "- Works in 1:1 chats\n"
+    "\n"
+    "Commands:\n"
+    "- /help : show this message\n"
+    "- /ping : health check (returns pong)\n"
+    "- /step <PART_ID> : STEP-only output\n"
+    "- /library <PART_ID> : force library ZIP output\n"
+    "\n"
     "Examples:\n"
     "- C2040\n"
     "- https://www.lcsc.com/product-detail/..._C2040.html\n"
-    "- /step C2040"
+    "- jlcpcb part number 2040\n"
+    "- https://jlcpcb.com/partdetail/.../C2040\n"
+    "- /step C2040\n"
+    "- /library C2040"
 )
 
 
@@ -221,9 +239,23 @@ def _extract_lcsc_id(text: str) -> Optional[str]:
     if hit:
         return hit.group(0).upper()
 
-    numeric_hit = LCSC_EXPLICIT_NUMERIC_RE.search(msg)
+    spaced_hit = PART_PREFIXED_SPACED_RE.search(msg)
+    if spaced_hit:
+        return f"C{spaced_hit.group(1)}"
+
+    numeric_hit = PART_EXPLICIT_NUMERIC_RE.search(msg)
     if numeric_hit:
-        return f"C{numeric_hit.group(1)}"
+        token = str(numeric_hit.group(1) or "").strip().upper()
+        if token.startswith("C"):
+            digits = token[1:]
+            if digits.isdigit():
+                return f"C{digits}"
+        elif token.isdigit():
+            return f"C{token}"
+
+    only_digits = msg.strip()
+    if only_digits.isdigit() and len(only_digits) >= 3:
+        return f"C{only_digits}"
 
     return None
 
@@ -270,7 +302,8 @@ def _process_lcsc_request(fc: FeishuClient, chat_id: str, text: str) -> None:
     if not lcsc_id:
         fc.send_text(
             chat_id,
-            "Could not find an LCSC ID in your message. Send a value like C2040 or an LCSC product link.",
+            "Could not find an LCSC/JLCPCB part ID in your message. "
+            "Send a value like C2040, a JLCPCB part number like 2040, or a product link.",
         )
         return
 
@@ -395,7 +428,10 @@ def handle_p2_im_chat_access_event_bot_p2p_chat_entered_v1(fc: FeishuClient, dat
             (operator_id[:8] + "***") if operator_id else "-",
         )
         if chat_id:
-            fc.send_text(chat_id, "Bot is online. Send an LCSC link or ID like C70078 for full KiCad library output.")
+            fc.send_text(
+                chat_id,
+                "Bot is online. Send an LCSC link or ID like C70078 for full KiCad library output. Use /help for commands.",
+            )
     except Exception:
         log.exception("Unhandled error in p2p-chat-entered callback")
 
